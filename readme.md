@@ -230,7 +230,7 @@ after N days:
 
 ##### **l. Extensions (nice next steps)**
 
-- Forecast **moisture/O2/CO2 too (their own regressors or another multi-output block) and roll them forward.
+- Forecast **moisture/O2/CO2** too (their own regressors or another multi-output block) and roll them forward.
 - Use ambient from a **weather feed** to enable Rule A.
 - Train **phase detector** on human labels if available.
 - Swap RandomForest for an LSTM/TCN for better multi-step accuracy.
