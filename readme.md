@@ -144,7 +144,7 @@ SLOPE_COOL = -0.2   # <= -> "cooling"
     - ```phase_change_next = (phase_next != phase)```
 4. For each temp in ```TARGET_TEMPS```: create a next temp (next-step regression targets).
 
-##### **d. Feature Engineering (lags; leakage-safe)
+##### **d. Feature Engineering (lags; leakage-safe)**
 
 - build **lagged features** for all raw sensors (features + ```TARGET_TEMPS```) per ```run_id```:
 - Drop rows that cannot form all lags or next-step targets.
