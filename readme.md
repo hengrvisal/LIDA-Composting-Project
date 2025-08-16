@@ -25,9 +25,20 @@
 
 ### **1. Abstract**
 
-This composting project focuses on optimizing the composting process with the use of a smart composting bin that utilizes AI technologies to decivesively automate necessary mechanisms.
+This project explores the development of a **smart composting system** that integrates AI technologies to optimize the composting process. The design features an automateed composting bin equipped with mixing paddles, ventilation systems, and a network of sensors to monitor key variables such as temperature, moisture, oxygen, CO2, and methane.
+
+To make sense of these sensor readings a guide automation, two complementary AI models are implemented:
+
+- A **multi-output forecasting model**, which predicts future compost conditions (temperature profiles across multiple probes) and estimates the expected end date of the composting process.
+- A **phase detection model**, which classifies the composting phase (heating, cooling, or stable) and detects phase transitions in real time.
+
+Together, these models provide both **predicitve insights** (where the process is heading) and **diagnotic awareness** (where the process currently is). By combining sensor-driven monitoring with AI-powered forecasting, the system can make informed decisions about when to activate ventialization, adjust mixing, or anticipate the completion of composting.
+
+The goal is to create a **data-driven, self-regulating composting system** that reduces human intervention, improves efficiency, and ensures a consistent, high-quality compost output.
 
 ### **2. Pre-requisites**
+
+Will add requirements.txt and mention necessary libraries/dependecies to run.
 
 ### **3. Architecture**
 
