@@ -1,76 +1,153 @@
-import time
-import pandas as pd
-from datetime import datetime, timedelta
+# src/controller.py
+# Offline controller with a built-in simulated bin (no MQTT/FastAPI).
+from __future__ import annotations
+import time, random
+from dataclasses import dataclass
+from typing import Dict, Generator, Optional
 
 from .config import MPCConf
-from .features import build_feature_row
-from .models import Forecaster
-from .mqtt_client import MQTTClient
-from .mpc import choose_action
-from .safety import safety_check
+from .safety import safety_check, SafetyStatus  # keep using your existing safety checks
 
-# --- Simple “state effect” for actions (domain heuristic) ---
-def action_to_state_effect(state_df: pd.DataFrame, action_level: float) -> pd.DataFrame:
+# ---------------------------
+# Simple internal simulator
+# ---------------------------
+@dataclass
+class SimState:
+    temp_c: float
+    moisture: float
+    oxygen: float = 0.21
+
+class SimulatedBin:
     """
-    Inject a small immediate effect of aeration on the latest row (cooling / O2).
-    Tune these numbers to your system or learn them from data.
+    Very simple thermal/moisture model for offline testing:
+    - Temperature increases due to microbial heat when idle
+    - Aeration cools proportionally to 'cooldown_bias'
+    - Moisture evaporates under aeration; recovers slowly when idle
     """
-    cooling = {0.0: 0.0, 1.0: -0.4}  # degC per control step (10min) — tune!
-    o2_bump = {0.0: 0.00, 1.0: 0.02} # +2% O2 proxy — if you simulate O2
-    latest = state_df.iloc[[-1]].copy()
+    def __init__(self, conf: MPCConf, seed: int = 42):
+        self.conf = conf
+        random.seed(seed)
+        self.state = SimState(
+            temp_c=52.0 + random.uniform(-1.5, 1.5),
+            moisture=0.55 + random.uniform(-0.03, 0.03),
+        )
 
-    for c in ["temperature_active1","temperature_active2","temperature_active3","temperature_active4"]:
-        if c in latest.columns:
-            latest[c] = latest[c].astype(float) + cooling.get(float(action_level), 0.0)
+    def step(self, dt_s: float, air_on_s: float):
+        air_on_s = max(0.0, min(air_on_s, dt_s))
+        cool = self.conf.cooldown_bias * air_on_s
+        heat = self.conf.heat_gain_bias * dt_s
 
-    if "oxygen" in latest.columns:
-        latest["oxygen"] = float(latest["oxygen"]) + o2_bump.get(float(action_level), 0.0)
+        # temperature dynamics
+        self.state.temp_c += heat * (1.0 + 0.2 * random.uniform(-1, 1))
+        self.state.temp_c -= cool * (1.0 + 0.2 * random.uniform(-1, 1))
 
-    return pd.concat([state_df, latest], ignore_index=True)
+        # moisture
+        self.state.moisture -= self.conf.moisture_evap_per_sec * air_on_s
+        if air_on_s < 1e-6:
+            self.state.moisture += self.conf.moisture_recover_per_sec * dt_s
 
-def command_payload(aeration_on: bool, seconds: int):
-    return {"device": "aeration", "state": "on" if aeration_on else "off", "seconds": int(seconds)}
+        # oxygen (keep above floor in sim)
+        self.state.oxygen = max(self.conf.o2_floor, 0.21)
 
-def run_controller(
-    sensor_stream,       # iterator yielding dicts: latest sensor frame
-    conf: MPCConf = MPCConf(),
-    step_sleep_s: int = 60,  # run every minute; actions are 10-min, but we can re-evaluate
-):
-    forecaster = Forecaster()
-    mqttc = MQTTClient()
+        # clamp
+        self.state.temp_c = max(10.0, min(self.state.temp_c, self.conf.temp_hard_max))
+        self.state.moisture = max(0.0, min(self.state.moisture, 1.0))
 
-    history = pd.DataFrame()
+    def read(self) -> Dict[str, float]:
+        # add tiny sensor noise
+        return {
+            "temperature_active1": self.state.temp_c + random.uniform(-0.15, 0.15),
+            "oxygen": self.state.oxygen,
+            "moisture": max(0.0, min(self.state.moisture + random.uniform(-0.005, 0.005), 1.0)),
+        }
 
+# ---------------------------
+# Offline MPC (simple heuristic)
+# ---------------------------
+class OfflineMPC:
+    def __init__(self, conf: MPCConf):
+        self.conf = conf
+
+    def decide_air_on_time(self, temp_c: float, moisture: float, dt_s: float) -> float:
+        # safety takes precedence (handled in loop)
+        err = temp_c - self.conf.setpoint_c
+        if err <= self.conf.deadband_c:
+            return 0.0
+
+        on_time = self.conf.k_on_per_deg * max(0.0, err)
+
+        # moisture protection
+        if moisture < self.conf.moisture_min:
+            scale = max(0.2, (moisture / self.conf.moisture_min))  # 0.2..1.0
+            on_time *= scale
+
+        # clamp
+        on_time = max(self.conf.min_on_sec, min(on_time, self.conf.max_on_sec))
+        return min(on_time, dt_s)
+
+# ---------------------------
+# Optional external stream (generator) for tests
+# ---------------------------
+def fake_sensor_stream(start_temp: float = 58.0) -> Generator[Dict[str, float], None, None]:
+    temp = start_temp
     while True:
-        frame = next(sensor_stream)   # latest sensors
-        ts = frame.get("time_stamp", datetime.utcnow().isoformat())
-        history = pd.concat([history, pd.DataFrame([frame])], ignore_index=True).tail(120)
+        temp += random.uniform(-0.2, 0.3)
+        yield {
+            "temperature_active1": temp,
+            "oxygen": 0.21,
+            "moisture": 0.55,
+        }
 
-        # Safety overrides first
-        safe = safety_check(frame)
-        if not safe.ok:
-            mqttc.publish_cmd(command_payload(True, conf.step_minutes * 60))
-            print(f"[{ts}] SAFETY: {safe.reason} -> Aeration ON")
-            time.sleep(step_sleep_s); mqttc.loop(); continue
+# ---------------------------
+# Controller loop
+# ---------------------------
+def run_controller(
+    sensor_stream: Optional[Generator[Dict[str, float], None, None]] = None,
+    conf: Optional[MPCConf] = None,
+    step_sleep_s: Optional[int] = None,
+    steps: int = 600,
+):
+    """
+    If sensor_stream is None, use the internal simulator.
+    Otherwise, we read from the stream and *still* compute a command (air_on_s),
+    but we won't send it anywhere (offline mode).
+    """
+    conf = conf or MPCConf()
+    dt = float(step_sleep_s if step_sleep_s is not None else conf.step_seconds)
 
-        # Build features and choose action via MPC
-        try:
-            action = choose_action(
-                state_hist=history,
-                forecaster=forecaster,
-                build_feature_fn=build_feature_row,
-                action_to_state_effect=action_to_state_effect,
-                conf=conf
-            )
-        except Exception as e:
-            # Fail-safe if model/feature construction fails
-            print(f"[{ts}] MPC error: {e} — defaulting to safe aeration")
-            action = 1
+    sim = SimulatedBin(conf) if sensor_stream is None else None
+    mpc = OfflineMPC(conf)
 
-        # Translate action to command; here action in {0,1}
-        seconds = conf.step_minutes * 60 if action == 1 else 0
-        mqttc.publish_cmd(command_payload(action == 1, seconds))
-        print(f"[{ts}] MPC action: {'ON' if action else 'OFF'} for {seconds}s")
+    print("=== OFFLINE CONTROLLER (simulated bin, no MQTT/FastAPI) ===")
+    print(f"Target: {conf.setpoint_c}°C  deadband: ±{conf.deadband_c}°C  dt={dt:.0f}s")
+    print(f"Safety: O2≥{conf.o2_floor*100:.0f}%  hard max {conf.temp_hard_max}°C\n")
 
-        mqttc.loop()
-        time.sleep(step_sleep_s)
+    for k in range(steps):
+        # Read sensors
+        frame = sim.read() if sim else next(sensor_stream)
+
+        # Safety check (forces aeration if unsafe)
+        s: SafetyStatus = safety_check(frame)
+        if not s.ok:
+            air_on_s = min(conf.max_on_sec, dt)  # force ON
+            reason = s.reason or "safety"
+        else:
+            # MPC decision
+            temp = float(frame["temperature_active1"])
+            moist = float(frame.get("moisture", 0.55))
+            air_on_s = mpc.decide_air_on_time(temp, moist, dt)
+            reason = "mpc"
+
+        # Advance sim if we own the plant
+        if sim:
+            sim.step(dt, air_on_s)
+
+        # Log to console
+        t = float(frame["temperature_active1"])
+        o2 = float(frame.get("oxygen", 0.21))
+        m = float(frame.get("moisture", 0.55))
+        print(f"step {k:04d} | T={t:5.1f}°C  O2={o2:.2f}  M={m:.3f}  air={air_on_s:4.1f}s  [{reason}]")
+
+        # Soft realtime feel (set to 0 for fast runs)
+        if step_sleep_s:
+            time.sleep(max(0.0, dt))
