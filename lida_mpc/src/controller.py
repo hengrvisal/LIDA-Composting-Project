@@ -28,7 +28,7 @@ class SimulatedBin:
         self.conf = conf
         random.seed(seed)
         self.state = SimState(
-            temp_c=52.0 + random.uniform(-1.5, 1.5),
+            temp_c=58.0 + random.uniform(-1.5, 1.5),
             moisture=0.55 + random.uniform(-0.03, 0.03),
         )
 

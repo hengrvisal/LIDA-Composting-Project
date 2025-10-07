@@ -1,130 +1,115 @@
-from __future__ import annotations
+# simulated_bin/sim_bin.py
+import numpy as np
 from dataclasses import dataclass
-import random
-import time
 from typing import Dict
 
-AMBIENT_TEMP = 25.0
-DT_MIN = 10  # minutes per step (aligns with MPCConf.step_minutes)
-
 @dataclass
-class Actuators:
-    fan_level: float = 0.0      # 0..1 (aeration duty)
-    lid_open: bool = False      # lid state via linear actuator
-    paddle_mix: bool = False    # one-shot “mix” pulse this step
-
 class BinSim:
+    """Compost bin simulator with simple microbial heat dynamics.
+
+    Key ideas:
+      - 'activity' (0..1) grows when O2 >= 10% and moisture in [0.35, 0.60]
+      - activity generates internal heat, strongest when T is below ~60°C
+      - fan adds O2 (and dries/cools), lid concept omitted for simplicity
     """
-    Simplified compost bin dynamics with 3 levels:
-      1) Active (hot): 4 probes (to mirror your model I/O)
-      2) Curing: 2 probes
-      3) Mature: implicit (we keep it near ambient internally)
+    start_temp_active: float = 25.0
+    start_temp_curing: float = 50.0
+    seed: int | None = None
 
-    Actuators: fan (aeration), lid (linear actuator), paddle (motorized)
-    Sensors returned each step:
-      - temperature_active1..4, temperature_curing1..2, oxygen, co2, methane
-      - lid_open, fan_level (telemetry)
-    """
-    def __init__(self,
-                 start_temp_active: float = 58.0,
-                 start_temp_curing: float = 50.0,
-                 start_o2: float = 0.21,
-                 seed: int | None = None):
-        if seed is not None:
-            random.seed(seed)
+    def __post_init__(self):
+        self.rng = np.random.default_rng(self.seed)
+        self.temp_active1 = self.start_temp_active
+        self.temp_curing1 = self.start_temp_curing
+        self.oxygen = 0.20      # start fairly oxygenated
+        self.moisture = 0.50
+        self.fan_level = 0.0
+        self.activity = 0.10    # initial microbial activity
 
-        # Internal “state”
-        self.act = Actuators()
-        self.time_s = 0.0
+                # Tunables (warmer + easier O2)
+        self.ambient = 25.0
+        self.loss_coeff = 0.002        # was 0.005 (slower loss to ambient)
+        self.base_heat = 0.02          # was 0.00 (tiny baseline exotherm)
+        self.heat_gain = 0.80          # was 0.30 (more microbial heat)
+        self.fan_cool_coeff = 0.03     # was 0.08 (fan cools less)
+        self.o2_resp = 0.060           # was 0.025 (fan raises O2 faster)
+        self.o2_leak = -0.0005         # was -0.002 (O2 decays slower)
+        self.moist_evap = 0.002        # was 0.004 (less drying while warming)
+        self.moist_recover = 0.0010    # was 0.0006 (slightly quicker recover)
+        self.activity = 0.20           # was 0.10 (seed a bit more activity)
 
-        # Temperatures (start around thermophilic)
-        self.ta = [start_temp_active + d for d in (0.0, -0.5, +0.6, -0.2)]
-        self.tc = [start_temp_curing - 1.0, start_temp_curing]
-        self.tmature = AMBIENT_TEMP + 2.0
+        # In _update_activity(): bump growth a hair (find these two lines below and set:)
+        k_up = 0.025    # was 0.015
+        k_down = 0.006  # was 0.008
 
-        # Gases
-        self.o2 = start_o2
-        self.co2 = 0.03
-        self.ch4 = 0.003
 
-        # process knobs (feel free to tune)
-        self.exo_heat_gain = 0.18       # base exothermic gain per 10min in Active
-        self.curing_gain = 0.06         # exothermic in curing
-        self.cool_per_fan = 0.55        # cooling per 10min at fan_level=1 (Active only)
-        self.mix_cool_boost = 0.6       # extra cooling when paddle mixes (one step)
-        self.lid_cool_bonus = 0.25      # extra passive cooling when lid is open
-        self.coupling = 0.06            # heat bleeding toward neighbors / ambient
-        self.o2_recovery = 0.02         # O2 rises per 10min at fan_level=1
-        self.o2_consumption = 0.005     # O2 drops per step from biology (rough)
-        self.noise = 0.15               # random noise scale
+    def set_actuators(self, fan_level: float, lid_open: bool, paddle_mix: bool):
+        self.fan_level = float(np.clip(fan_level, 0.0, 1.0))
+        # lid_open and paddle_mix ignored in this simplified sim, but kept for API
 
-    def set_actuators(self, fan_level: float | None = None, lid_open: bool | None = None, paddle_mix: bool | None = None):
-        if fan_level is not None:
-            self.act.fan_level = max(0.0, min(1.0, float(fan_level)))
-        if lid_open is not None:
-            self.act.lid_open = bool(lid_open)
-        if paddle_mix is not None:
-            self.act.paddle_mix = bool(paddle_mix)
+    def _update_activity(self):
+        # Conditions for growth
+        ok_o2 = self.oxygen >= 0.10
+        ok_moist = 0.35 <= self.moisture <= 0.60
+        cond = 1.0 if (ok_o2 and ok_moist) else 0.0
 
-    def _cooling_term(self) -> float:
-        base = self.cool_per_fan * self.act.fan_level
-        if self.act.paddle_mix:
-            base += self.mix_cool_boost
-        if self.act.lid_open:
-            base += self.lid_cool_bonus
-        return base
+        # Temperature influence: microbes love ~40–65°C, weaker outside
+        t = self.temp_active1
+        if t < 30: t_factor = 0.25 * (t - 20) / 10.0           # 20→30°C ramps to ~0.25
+        elif t < 55: t_factor = 0.25 + 0.75 * (t - 30) / 25.0  # 30→55°C ramps to 1.0
+        elif t < 70: t_factor = 1.0 - 0.5 * (t - 55) / 15.0    # 55→70°C drops to ~0.5
+        else: t_factor = 0.2                                    # too hot
 
-    def _step_temperatures(self):
-        cool = self._cooling_term()
+        # Growth/decay of activity (logistic-ish)
+        k_up = 0.015     # growth rate
+        k_down = 0.008   # decay rate
+        a = self.activity
+        a += k_up * cond * t_factor * (1.0 - a) - k_down * (1.0 - cond) * a
+        self.activity = float(np.clip(a, 0.0, 1.0))
 
-        # Active: exothermic up, cooling down, plus coupling to ambient
-        for i in range(len(self.ta)):
-            d_exo = self.exo_heat_gain
-            d_cool = cool
-            d_couple = self.coupling * (AMBIENT_TEMP - self.ta[i])
-            self.ta[i] += d_exo - d_cool + d_couple + random.uniform(-self.noise, self.noise)
+    def _microbial_heat(self):
+        # Diminish heat as temp exceeds ~60°C (prevent runaway)
+        t = self.temp_active1
+        cap = 60.0
+        if t <= cap:
+            temp_factor = 1.0
+        else:
+            temp_factor = max(0.0, 1.0 - (t - cap) / 20.0)  # fades to 0 by ~80°C
+        # Fan reduces net heat effect (forced convection)
+        fan_factor = 1.0 - self.fan_level
+        return self.base_heat + self.heat_gain * self.activity * temp_factor * fan_factor
 
-        # Curing follows active with lower gain & coupling
-        avg_active = sum(self.ta) / len(self.ta)
-        for i in range(len(self.tc)):
-            target = 0.6 * avg_active + 0.4 * AMBIENT_TEMP
-            d_exo = self.curing_gain
-            d_couple = 0.5 * self.coupling * (target - self.tc[i])
-            self.tc[i] += d_exo + d_couple + random.uniform(-self.noise*0.8, self.noise*0.8)
+    def step(self) -> Dict:
+        # --- Update activity based on current state ---
+        self._update_activity()
 
-        # Mature drifts to ambient gently
-        self.tmature += 0.2 * self.coupling * (AMBIENT_TEMP - self.tmature)
+        # --- Temperature dynamics ---
+        # 1) passive loss to ambient
+        dT_loss = -self.loss_coeff * (self.temp_active1 - self.ambient)
+        # 2) microbial heat generation
+        dT_heat = self._microbial_heat()
+        # 3) extra fan cooling
+        dT_fan = -self.fan_cool_coeff * self.fan_level
+        # 4) small noise
+        noise = self.rng.normal(0.0, 0.03)
 
-        # Reset one-shot paddle action
-        self.act.paddle_mix = False
+        self.temp_active1 += dT_loss + dT_heat + dT_fan + noise
 
-    def _step_gases(self):
-        # O2: consumption vs aeration recovery
-        self.o2 -= self.o2_consumption
-        self.o2 += self.o2_recovery * self.act.fan_level
-        self.o2 = max(0.05, min(0.21, self.o2))
+        # --- Oxygen dynamics ---
+        # Fan pushes O2 up; without fan, O2 slowly drops due to consumption/leak
+        self.oxygen += self.o2_resp * (self.fan_level - 0.5) + self.o2_leak * (1.0 - self.fan_level)
+        self.oxygen = float(np.clip(self.oxygen, 0.07, 0.21))
 
-        # CO2/CH4: very rough relationships
-        self.co2 = 0.025 + (0.65 * (0.21 - self.o2))   # more CO2 when O2 lower
-        self.ch4 = max(0.000, 0.002 + (0.21 - self.o2) * 0.01)
-
-    def step(self) -> Dict[str, float]:
-        """Advance simulation by DT_MIN and return a sensor frame."""
-        self._step_temperatures()
-        self._step_gases()
-        self.time_s += DT_MIN * 60
+        # --- Moisture dynamics ---
+        self.moisture -= self.moist_evap * self.fan_level
+        if self.fan_level < 0.2:
+            self.moisture += self.moist_recover * (0.55 - self.moisture)  # drift back up slowly
+        self.moisture = float(np.clip(self.moisture, 0.30, 0.60))
 
         return {
-            "time_stamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.time_s)),
-            "temperature_active1": self.ta[0],
-            "temperature_active2": self.ta[1],
-            "temperature_active3": self.ta[2],
-            "temperature_active4": self.ta[3],
-            "temperature_curing1": self.tc[0],
-            "temperature_curing2": self.tc[1],
-            "oxygen": self.o2,
-            "co2": self.co2,
-            "methane": self.ch4,
-            "lid_open": float(self.act.lid_open),
-            "fan_level": float(self.act.fan_level),
+            "temperature_active1": float(self.temp_active1),
+            "temperature_curing1": float(self.temp_curing1),
+            "oxygen": float(self.oxygen),
+            "moisture": float(self.moisture),
+            "fan_level": float(self.fan_level),
+            "activity": float(self.activity),
         }

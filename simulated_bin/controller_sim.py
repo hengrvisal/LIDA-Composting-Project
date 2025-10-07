@@ -2,88 +2,56 @@
 from __future__ import annotations
 import argparse
 import time
+import pandas as pd
 from typing import Dict
-import sys
-from pathlib import Path
+from dataclasses import dataclass
 
-# ---- Robust path bootstrap so imports work whether src/ lives at root or lida_mcp/src
-ROOT = Path(__file__).resolve().parents[1]  # project root (.. from simulated_bin/)
-CANDIDATE_PARENTS_OF_SRC = [
-    ROOT,                  # when src/ is directly under project root
-    ROOT / "lida_mcp",     # your current structure: lida_mcp/src/...
-]
-for parent in CANDIDATE_PARENTS_OF_SRC:
-    if parent.exists() and str(parent) not in sys.path:
-        sys.path.insert(0, str(parent))
-
-# Optional: keep ROOT itself on path for non-package imports in root
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-# ---- Config
-try:
-    from src.config import MPCConf
-except Exception:
-    from config import MPCConf  # fallback if modules aren’t under a src package
-
-# ---- Safety
-try:
-    from src.safety import safety_check
-except Exception:
-    try:
-        from safety import safety_check
-    except Exception:
-        class _S:
-            def __init__(self, ok, reason=""): self.ok = ok; self.reason = reason
-        def safety_check(frame):
-            t = float(frame.get("temperature_active1", 0))
-            o2 = float(frame.get("oxygen", 0.21))
-            ok = (t < 80.0) and (o2 >= 0.10)
-            return _S(ok, "" if ok else "Fallback safety tripped")
-
-# ---- Simulator
+from .config import MPCConf
 from .sim_bin import BinSim
+from .safety import safety_check
 
-# ---- Optional MPC stack; fallback to rule-based if unavailable
 HAVE_MPC = True
 try:
-    try:
-        from src.mpc import choose_action
-        from src.models import Forecaster
-        from src.features import build_feature_row
-    except Exception:
-        from mpc import choose_action
-        from models import Forecaster
-        from features import build_feature_row
-except Exception:
+    from .mpc import choose_action
+    from .models import Forecaster
+    from .features import build_feature_row
+except Exception as e:
+    print(f"[WARN] MPC stack unavailable: {e}")
     HAVE_MPC = False
 
-# ---------- Control policies ----------
+
+@dataclass
+class SafetyStatus:
+    ok: bool
+    reason: str = ""
+
+
 def rule_based_action(frame: Dict, conf: MPCConf) -> Dict:
     t = float(frame["temperature_active1"])
     o2 = float(frame.get("oxygen", 0.21))
     fan, lid, mix = 0.0, False, False
 
-    if t > conf.temp_hi:
-        fan = 1.0; lid = True
-        if t > (conf.temp_hi + 3.0): mix = True
-    elif t < (conf.temp_lo - 1.0):
-        fan = 0.0; lid = False
-    else:
+    if t > conf.setpoint_c + 3:
+        fan, lid = 1.0, True
+    elif t > conf.setpoint_c:
         fan = 0.5
+    elif t < conf.setpoint_c - 2:
+        fan, lid = 0.0, False
 
-    if o2 < conf.o2_floor:
-        fan = 1.0; lid = True
+    if o2 < 0.10:
+        fan, lid = 1.0, True
 
     return {"fan_level": fan, "lid_open": lid, "paddle_mix": mix}
+
 
 def mpc_action(state_hist_df, forecaster, conf: MPCConf):
     def action_to_state_effect(df, a_level):
         last = df.iloc[[-1]].copy()
         cool = 0.55 * a_level
-        for c in ["temperature_active1","temperature_active2","temperature_active3","temperature_active4"]:
-            last[c] = last[c] - cool
-        out = df.copy(); out.iloc[-1] = last.iloc[0]; return out
+        last["temperature_active1"] -= cool
+        out = df.copy()
+        out.iloc[-1] = last.iloc[0]
+        return out
 
     a = choose_action(
         state_hist=state_hist_df,
@@ -94,48 +62,77 @@ def mpc_action(state_hist_df, forecaster, conf: MPCConf):
     )
     return {"fan_level": float(a), "lid_open": bool(a > 0.0), "paddle_mix": False}
 
-# ---------- Main loop ----------
+
 def run_sim(steps: int, use_mpc: bool, sleep_s: float, seed: int | None = None):
     conf = MPCConf()
-    bin = BinSim(start_temp_active=58.0, start_temp_curing=50.0, seed=seed)
+    # start near ambient
+    sim = BinSim(start_temp_active=25.0, start_temp_curing=50.0, seed=seed)
 
-    state_hist_df, forecaster = None, None
-    if use_mpc and HAVE_MPC:
-        forecaster = Forecaster()
-
-    import pandas as pd
+    forecaster = Forecaster() if (use_mpc and HAVE_MPC) else None
     history_rows = []
 
     for k in range(steps):
-        frame = bin.step()
+        frame = sim.step()
         s = safety_check(frame)
+
+        # inside run_sim loop, after s = safety_check(frame)
+        t_active = float(frame["temperature_active1"])
+        o2 = float(frame.get("oxygen", 0.21))
 
         if not s.ok:
             act = {"fan_level": 1.0, "lid_open": True, "paddle_mix": True}
+            mode = "[safety]"
+
+        elif conf.warmup_lockout and t_active < conf.warmup_temp_c:
+            # --- Warm-up O2 keeper ---
+            # Keep just enough air to maintain O2 >= floor, otherwise no cooling.
+                o2_target = conf.warmup_o2_floor + conf.warmup_o2_margin  # e.g., 0.12
+                o2_off = o2_target + 0.01                                  # hysteresis to turn off
+                deficit = o2_target - o2
+
+                if o2 < o2_target:
+                    # Stronger push up to the cap, but never below min_fan while below target
+                    fan_cmd = max(conf.warmup_min_fan,
+                                min(conf.warmup_max_fan, conf.warmup_kp * max(0.0, deficit)))
+                elif o2 < o2_off:
+                    fan_cmd = 0.15     # small trickle across the boundary
+                else:
+                    fan_cmd = 0.0
+
+                act = {"fan_level": float(fan_cmd),
+                    "lid_open": bool(conf.warmup_lid_open),
+                    "paddle_mix": False}
+                mode = "[warmup-o2]"
+
+
+        elif use_mpc and HAVE_MPC:
+            history_rows.append(frame)
+            df = pd.DataFrame(history_rows[-12:])
+            act = mpc_action(df, forecaster, conf)
+            mode = "[mpc]"
+
         else:
-            if use_mpc and HAVE_MPC:
-                history_rows.append(frame)
-                state_hist_df = pd.DataFrame(history_rows[-12:])
-                act = mpc_action(state_hist_df, forecaster, conf)
-            else:
-                act = rule_based_action(frame, conf)
+            act = rule_based_action(frame, conf)
+            mode = "[rule]"
 
-        bin.set_actuators(**act)
 
-        print(f"[{k:03d}] Tact1={frame['temperature_active1']:.2f}C "
-              f"Tcur1={frame['temperature_curing1']:.2f}C "
-              f"O2={frame['oxygen']:.3f}  "
-              f"fan={act['fan_level']:.2f} lid={'open' if act['lid_open'] else 'closed'} "
-              f"{'mix' if act['paddle_mix'] else ''}")
+        sim.set_actuators(**act)
+
+        print(f"step {k:03d} | "
+              f"T={frame['temperature_active1']:.2f}°C  "
+              f"O2={frame['oxygen']:.2f}  "
+              f"M={frame['moisture']:.3f}  "
+              f"fan={act['fan_level']:.2f}  {mode}")
 
         if sleep_s > 0:
             time.sleep(sleep_s)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Run simulated compost bin controller (no MQTT/FastAPI).")
-    p.add_argument("--steps", type=int, default=60, help="Number of control steps to simulate")
-    p.add_argument("--sleep-s", type=float, default=0, help="Seconds to sleep between steps (0 = fastest)")
-    p.add_argument("--mpc", action="store_true", help="Use MPC (requires trained model files).")
-    p.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    p = argparse.ArgumentParser(description="Run simulated compost bin (ML-based MPC).")
+    p.add_argument("--steps", type=int, default=60)
+    p.add_argument("--sleep-s", type=float, default=0)
+    p.add_argument("--mpc", action="store_true")
+    p.add_argument("--seed", type=int, default=None)
     args = p.parse_args()
+
     run_sim(steps=args.steps, use_mpc=args.mpc, sleep_s=args.sleep_s, seed=args.seed)

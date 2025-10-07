@@ -1,1 +1,2 @@
-from .sim_bin import BinSim, Actuators
+# simulated_bin/__init__.py
+# Marks the folder as a package; no code required.
