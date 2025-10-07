@@ -12,15 +12,15 @@ class MPCConf:
     cost_fan_weight: float = 0.2
     cost_moisture_weight: float = 0.5
 
-    # Warm-up gating
-    warmup_lockout: bool = True
-    warmup_temp_c: float = 50.0
+    # phase thresholds
+    warmup_temp_c: float = 50.0     # enter ACTIVE when >= this
+    curing_exit_c: float = 45.0     # drop below -> CURING (with hysteresis margin)
+    phase_hyst_c: float = 2.0       # hysteresis margin
 
-    # Warm-up O2 keeper (IMPORTANT: min fan must be > 0.5 in YOUR model)
+    # warm-up O2 controller (see controller_sim)
     warmup_o2_floor: float = 0.10
-    warmup_o2_margin: float = 0.02   # was 0.01 → target = 0.12
-    warmup_min_fan: float = 0.55     # ≥ 0.5 so O2 actually rises in your sim
-    warmup_max_fan: float = 0.70     # cap to avoid over-cooling
-    warmup_kp: float = 30.0          # strong push when below target
+    warmup_o2_margin: float = 0.02  # target ~ 0.12
+    warmup_min_fan: float = 0.55
+    warmup_max_fan: float = 0.70
+    warmup_kp: float = 30.0
     warmup_lid_open: bool = False
-    warmup_temp_c: float = 50.0
