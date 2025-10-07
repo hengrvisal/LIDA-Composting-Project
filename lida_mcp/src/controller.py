@@ -50,7 +50,7 @@ def run_controller(
         safe = safety_check(frame)
         if not safe.ok:
             mqttc.publish_cmd(command_payload(True, conf.step_minutes * 60))
-            print(f"[{ts}] SAFETY: {safe.reason} → Aeration ON")
+            print(f"[{ts}] SAFETY: {safe.reason} -> Aeration ON")
             time.sleep(step_sleep_s); mqttc.loop(); continue
 
         # Build features and choose action via MPC
