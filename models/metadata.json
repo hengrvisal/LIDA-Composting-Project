@@ -1,0 +1,10 @@
+{
+  "saved_at": "2025-10-07T04:47:04Z",
+  "python": "3.11.9",
+  "artifacts": {
+    "forecaster": "forecaster.joblib",
+    "phase_clf": "phase.joblib",
+    "feature_order_reg": "feature_order_reg.json",
+    "feature_order_cls": "feature_order_cls.json"
+  }
+}

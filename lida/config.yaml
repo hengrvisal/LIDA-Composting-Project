@@ -1,0 +1,20 @@
+broker:
+  host: "YOUR_BROKER"
+  port: 8883
+  tls: true
+  client_id: "lida_mpc_client"
+  # cert/key paths if TLS
+topics:
+  telemetry: "bin/telemetry/active/state"
+  shadow_cmd: "bin/mpc/shadow_cmd"
+  live_air:  "bin/cmd/aeration"
+  live_mix:  "bin/cmd/mixer"
+control:
+  Ts_s: 300
+  T_set: 55.0
+  M_set: 0.55
+  T_bounds: [45, 65]
+  M_bounds: [0.45, 0.65]
+  u1_rate_limit: 0.3
+paths:
+  models_dir: "models"
