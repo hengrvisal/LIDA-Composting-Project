@@ -19,11 +19,11 @@ HAVE_MPC = True
 try:
     try:
         from src.mpc import choose_action
-        from src.models import Forecaster
+        from src.models import Forecaster, PhaseModel
         from src.features import build_feature_row
     except Exception:
         from mpc import choose_action
-        from models import Forecaster
+        from models import Forecaster, PhaseModel
         from features import build_feature_row
 except Exception:
     HAVE_MPC = False
@@ -77,6 +77,7 @@ def run_sim(steps: int, use_mpc: bool, sleep_s: float, seed: int | None, dt_min:
     last_phase = phase
 
     forecaster = Forecaster() if (use_mpc and HAVE_MPC) else None
+    phase_model = PhaseModel() if (use_mpc and HAVE_MPC) else None
     history_rows = []
 
     # simple mixing policy: mix when very hot (helps dissipation) or periodically in ACTIVE
@@ -123,21 +124,29 @@ def run_sim(steps: int, use_mpc: bool, sleep_s: float, seed: int | None, dt_min:
         else:
             if use_mpc and HAVE_MPC:
                 history_rows.append(frame)
-                df = pd.DataFrame(history_rows[-12:])  # short horizon history
-                act = mpc_action(df, forecaster, conf)
-                mode = "[mpc]"
+                # pick the slice length the forecaster needs (LSTM vs tabular)
+                need_w = max(1, forecaster.need_window())
+                df_hist = pd.DataFrame(history_rows[-need_w:]).reset_index(drop=True)
+
+                # Optional: infer phase from model (if available) to tweak MPC targets
+                if phase_model is not None:
+                    phase_pred = phase_model.predict(df_hist)
+                else:
+                    phase_pred = "ACTIVE" if float(frame["temperature_active1"]) >= conf.warmup_temp_c else "CURING"
+
+                # Example: adjust set band when curing (gentler target)
+                # (You can move these into conf or pass to choose_action)
+                if phase_pred.upper().startswith("CUR"):
+                    conf.temp_lo, conf.temp_hi = 40.0, 55.0
+                else:
+                    conf.temp_lo, conf.temp_hi = 55.0, 65.0
+
+                act = mpc_action(df_hist, forecaster, conf)
+                mode = f"[mpc|phase={phase_pred}]"
             else:
                 act = rule_based_action(frame, conf)
                 mode = "[rule]"
 
-            # ACTIVE-phase mixing rule:
-            #  - if T gets very hot (e.g., > 65°C), mix immediately (with 10 min min-gap)
-            #  - otherwise, mix periodically (once per mix_period_steps) to vent heat
-            if phase == "ACTIVE":
-                if T > 65.0 and k - last_mix_step > max(1, int(round(10.0 / dt_min))):
-                    act["paddle_mix"] = True
-                elif (k - last_mix_step) >= mix_period_steps:
-                    act["paddle_mix"] = True
 
         # record & emit paddle-mix event flag
         if act.get("paddle_mix"):
