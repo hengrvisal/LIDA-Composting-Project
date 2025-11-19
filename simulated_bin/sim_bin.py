@@ -61,8 +61,8 @@ class BinSim:
 
         # Fan and transport
         self.fan_cool_coeff = 0.03     # was 0.08 (fan cools less)
-        self.o2_resp = 0.060           # was 0.025 (fan raises O2 faster)
-        self.o2_leak = -0.0005         # was -0.002 (O2 decays slower)
+        self.o2_resp = 0.060           # controlls how the fans boost oxygen
+        self.o2_leak = -0.0005         # o2 loss due to microbes consumption
 
         # Moisture dynamics
         self.moist_evap = 0.002        # was 0.004 (less drying while warming)
